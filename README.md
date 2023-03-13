@@ -26,7 +26,12 @@ Request Body Sample
 > }
 
 `/api/v1/price-data/upload-price-list`
-Takes a csv file with a maximum file size of 5TB in the format UNIX,SYMBOL,OPEN,HIGH,LOW,CLOSE
+Takes a csv file with a maximum file size of 5TB in the format UNIX,SYMBOL,OPEN,HIGH,LOW,CLOSE.
+
+For performance, as soon as the file chunks are being sent to the server, they're read and split into batches
+which are picked up by worker goroutines. These worker goroutines are in charge of bulk inserting each
+batch of data into the database. This is a much faster approach than having the whole file uploaded to the
+server before processing starts.
 
 **RUNNING THE PROJECT**
 
