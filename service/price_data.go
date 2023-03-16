@@ -7,7 +7,6 @@ import (
 	"strconv"
 
 	"github.com/adetunjii/ohlc/db/model"
-	"github.com/lib/pq"
 )
 
 const (
@@ -73,14 +72,8 @@ func (s *Service) BulkInsertPrice(ctx context.Context, r io.Reader) error {
 		select {
 		case err := <-errChan:
 			if err != nil {
-				if pqErr, ok := err.(*pq.Error); ok {
-					if pqErr.Code == "57P03" {
-						continue
-					}
-				} else {
-					s.logger.Error("error uploading data (%v)", err)
-					return err
-				}
+				s.logger.Error("error uploading data (%v)", err)
+				return err
 			}
 		case <-done:
 			return nil
@@ -111,7 +104,6 @@ func processRow(row []string) (price model.PriceData, err error) {
 	if err := price.Validate(); err != nil {
 		return model.PriceData{}, err
 	}
-
 	return
 }
 
