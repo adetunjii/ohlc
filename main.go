@@ -16,7 +16,7 @@ func main() {
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		logger.Fatal("failed to load config", err)
+		logger.Fatal("failed to load config%v", err)
 	}
 
 	dbConfig := &db.Config{

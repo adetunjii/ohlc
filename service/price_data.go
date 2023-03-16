@@ -7,11 +7,12 @@ import (
 	"strconv"
 
 	"github.com/adetunjii/ohlc/db/model"
+	"github.com/lib/pq"
 )
 
 const (
-	numOfGoroutines = 10
-	batchSize       = 100
+	maxNumOfGoroutines = 10
+	batchSize          = 100 // maximum number of rows
 )
 
 func (s *Service) ListPrices(ctx context.Context, arg model.ListPriceParams) ([]model.PriceData, int64, error) {
@@ -46,8 +47,11 @@ func (s *Service) BulkInsertPrice(ctx context.Context, r io.Reader) error {
 	}()
 	done := make(chan struct{})
 
+	// ctx, cancel := context.WithDeadline(ctx, time.Now().Add(1*time.Minute))
+	// defer cancel()
+
 	// worker goroutines pick up the data in batches and batch insert it into the database
-	for i := 0; i < numOfGoroutines; i++ {
+	for i := 0; i < maxNumOfGoroutines; i++ {
 		go func() {
 
 			for batch := range batchChan {
@@ -60,7 +64,6 @@ func (s *Service) BulkInsertPrice(ctx context.Context, r io.Reader) error {
 					errChan <- err
 				}
 			}
-
 			done <- struct{}{}
 		}()
 	}
@@ -70,13 +73,25 @@ func (s *Service) BulkInsertPrice(ctx context.Context, r io.Reader) error {
 		select {
 		case err := <-errChan:
 			if err != nil {
-				s.logger.Error("error bulk inserting data", err)
-				return err
+				if pqErr, ok := err.(*pq.Error); ok {
+					if pqErr.Code == "57P03" {
+						continue
+					}
+				} else {
+					s.logger.Error("error uploading data (%v)", err)
+					return err
+				}
 			}
 		case <-done:
 			return nil
+			// case <-ctx.Done():
+			// 	return errors.New("file did not upload completely")
 		}
 	}
+}
+
+func (s *Service) RetryFromDeadQueue(ctx context.Context) error {
+	return s.sqlstore.PriceData().RetryFromDeadQueue(ctx)
 }
 
 // converts each row in the csv file to type model.PriceData

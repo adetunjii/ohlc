@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"path"
+	"strings"
 
 	"github.com/adetunjii/ohlc/db/model"
 	"github.com/gin-gonic/gin"
@@ -13,6 +14,7 @@ import (
 var (
 	ErrReadingFormData = errors.New("error reading form data")
 	ErrInvalidFileType = errors.New("invalid file type. Only csv files are supported")
+	ErrFailedRetry     = errors.New("failed to insert data during retry")
 )
 
 // 5TB max file size
@@ -25,6 +27,8 @@ func (s *Server) priceDataRouteGroup(r *gin.RouterGroup) {
 	priceData.POST("/create", s.createPrice)
 	priceData.POST("/upload-price-list", s.uploadPriceList)
 
+	// to be called by a CRON JOB
+	priceData.GET("/retry-failed", s.retryFailedPriceListInsertion)
 }
 
 type getPricesQuery struct {
@@ -34,7 +38,6 @@ type getPricesQuery struct {
 }
 
 func (s *Server) getAllPrices(ctx *gin.Context) {
-
 	var queryParams getPricesQuery
 	err := ctx.ShouldBindQuery(&queryParams)
 	if err != nil {
@@ -48,7 +51,7 @@ func (s *Server) getAllPrices(ctx *gin.Context) {
 	listPriceParams := model.ListPriceParams{
 		Limit:  limit,
 		Offset: offset,
-		Symbol: queryParams.Symbol,
+		Symbol: strings.Trim(queryParams.Symbol, " "),
 	}
 
 	priceList, count, err := s.svc.ListPrices(ctx, listPriceParams)
@@ -66,7 +69,6 @@ func (s *Server) getAllPrices(ctx *gin.Context) {
 			"content":    priceList,
 		},
 	})
-
 }
 
 type priceDataRequest struct {
@@ -96,7 +98,7 @@ func (s *Server) createPrice(ctx *gin.Context) {
 	}
 
 	if err := priceData.Validate(); err != nil {
-		s.logger.Error("error parsing invalid data", err)
+		s.logger.Error("error parsing invalid data %v", err)
 		ctx.JSON(http.StatusBadRequest, errorResponse(err))
 		return
 	}
@@ -117,13 +119,12 @@ func (s *Server) uploadPriceList(ctx *gin.Context) {
 
 	formData, err := ctx.MultipartForm()
 	if err != nil {
-		s.logger.Error("error reading multipart form data", err)
+		s.logger.Error("error reading multipart form data %v", err)
 		ctx.JSON(http.StatusInternalServerError, errorResponse(ErrReadingFormData))
 		return
 	}
 
 	for _, fh := range formData.File {
-
 		for _, header := range fh {
 			fileExt := path.Ext(header.Filename)
 
@@ -143,7 +144,7 @@ func (s *Server) uploadPriceList(ctx *gin.Context) {
 			// send the data chunks to the service layer for processing
 			bufReader := bufio.NewReader(file)
 			if err := s.svc.BulkInsertPrice(ctx, bufReader); err != nil {
-				ctx.JSON(http.StatusInternalServerError, errorResponse(ErrReadingFormData))
+				ctx.JSON(http.StatusInternalServerError, errorResponse(err))
 				return
 			}
 		}
@@ -153,4 +154,16 @@ func (s *Server) uploadPriceList(ctx *gin.Context) {
 		"message": "file uploaded successfully",
 	})
 
+}
+
+func (s *Server) retryFailedPriceListInsertion(ctx *gin.Context) {
+
+	if err := s.svc.RetryFromDeadQueue(ctx); err != nil {
+		ctx.JSON(http.StatusInternalServerError, errorResponse(ErrFailedRetry))
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{
+		"message": "successfully inserted all rows",
+	})
 }

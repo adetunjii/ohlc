@@ -2,18 +2,20 @@ package sqlstore
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
-	"strings"
 
 	"github.com/adetunjii/ohlc/db/model"
 )
 
 type PriceDataStore struct {
+	deadQueue chan []interface{} // TODO: move implementation to a message broker
 	*SqlStore
 }
 
 func newPriceDataStore(sqlstore *SqlStore) *PriceDataStore {
-	return &PriceDataStore{sqlstore}
+	q := make(chan []interface{})
+	return &PriceDataStore{q, sqlstore}
 }
 
 const createPriceData = `
@@ -35,20 +37,28 @@ const listPrices = "SELECT id, open, close, low, high, unix, symbol, created_at 
 const countRows = "SELECT COUNT(*) FROM price_data"
 
 func (p *PriceDataStore) ListPrices(ctx context.Context, arg model.ListPriceParams) ([]model.PriceData, int64, error) {
-
+	var rows *sql.Rows
+	var err error
 	sql := listPrices
 
+	// Writing the queries in this manner prevents against sql injection
+	// The arguments are are sent seperately along with the prepared statement
 	if arg.Symbol != "" {
-		sql = fmt.Sprintf(listPrices+" WHERE LOWER(symbol) LIKE '%%%s%%' ", strings.ToLower(arg.Symbol))
-	}
-	sql += `
-	OFFSET $1
-	LIMIT $2;` // end of query
+		expr := "%" + arg.Symbol + "%"
+		sql = fmt.Sprintf("%s WHERE LOWER(symbol) LIKE $1 OFFSET $1 LIMIT $2;", listPrices)
 
-	rows, err := p.db.QueryContext(ctx, sql, arg.Offset, arg.Limit)
-	if err != nil {
-		p.logger.Error("error querying rows", err)
-		return nil, 0, err
+		rows, err = p.db.QueryContext(ctx, sql, expr, arg.Offset, arg.Limit)
+		if err != nil {
+			p.logger.Error("error querying rows", err)
+			return nil, 0, err
+		}
+	} else {
+		sql = fmt.Sprintf("%s OFFSET $1 LIMIT $2;", listPrices)
+		rows, err = p.db.QueryContext(ctx, sql, arg.Offset, arg.Limit)
+		if err != nil {
+			p.logger.Error("error querying rows %v", err)
+			return nil, 0, err
+		}
 	}
 
 	prices := []model.PriceData{}
@@ -79,28 +89,36 @@ func (p *PriceDataStore) BatchInsertPrice(ctx context.Context, batch []model.Pri
 
 	tx, err := p.db.Begin()
 	if err != nil {
+		p.logger.Error("error initiating db transaction (%v)", err)
 		return err
 	}
+	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(createPriceData)
 	if err != nil {
 		p.logger.Error("error preparing transaction statement: ", err)
-		return tx.Rollback()
+		return err
 	}
 	defer stmt.Close()
 
-	// create an interface array with a capacity of the batch length * amount of items per row
-	values := make([][]interface{}, 0, len(batch)*6)
-
+	values := make([][]interface{}, 0, len(batch))
 	for _, d := range batch {
-		values = append(values, []interface{}{d.Symbol, d.Open, d.Close, d.High, d.Low, d.Unix})
+		values = append(values, []interface{}{
+			d.Symbol,
+			d.Open,
+			d.Close,
+			d.High,
+			d.Low,
+			d.Unix,
+		})
 	}
 
 	for _, v := range values {
 		_, err := stmt.Exec(v...)
 		if err != nil {
-			p.logger.Error("error executing transaction", err)
-			return tx.Rollback()
+			p.logger.Error("error executing transaction (%v), sending data to dead queue...", err)
+			// push the values into a deadqueue for retry
+			p.deadQueue <- v
 		}
 	}
 
@@ -109,5 +127,36 @@ func (p *PriceDataStore) BatchInsertPrice(ctx context.Context, batch []model.Pri
 		return err
 	}
 
+	return nil
+}
+
+// RetryFromDeadQueue attempts to retry failed insertion of values
+// into the database. It reads data from the deadQueue channel and
+// inserts it into the database.
+// For resiliency and fault tolerance, ideally this should read data
+// from a messaging queue.
+//
+// If there is still a failure during insertion, the data is  written
+// back into the queue so that it can be retried at
+// some later time.
+func (p *PriceDataStore) RetryFromDeadQueue(ctx context.Context) error {
+
+	stmt, err := p.db.PrepareContext(ctx, createPriceData)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for item := range p.deadQueue {
+		_, err := stmt.Exec(item...)
+		if err != nil {
+			p.logger.Error("error inserting from the dead queue (%v). Writing back to deadQueue...", err)
+			// write back to the queue
+			p.deadQueue <- item
+			return err
+		}
+	}
+
+	close(p.deadQueue)
 	return nil
 }

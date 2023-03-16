@@ -6,7 +6,7 @@ import (
 	"fmt"
 
 	"github.com/adetunjii/ohlc/pkg/logging"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "github.com/lib/pq"
 )
 
 type Config struct {
@@ -20,7 +20,6 @@ type Config struct {
 
 type PostgresDB struct {
 	logger *logging.Logger
-
 	*sql.DB
 }
 
@@ -48,7 +47,7 @@ func (p *PostgresDB) Connect(config *Config) error {
 		dsn = databaseUrl
 	}
 
-	db, err := sql.Open("pgx", dsn)
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return err
 	}
